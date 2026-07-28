@@ -20,6 +20,7 @@ class VoiceInputManager {
     private var micSeq: Int32 = 2
     private var lastToggleTime: Date = .distantPast
     private var latestText = ""
+    private var typedText = ""
     private let defaults = UserDefaults.standard
 
     var volcengineAppKey: String {
@@ -54,8 +55,11 @@ class VoiceInputManager {
         postStateNotification(false)
         log("停止录音…")
 
+        // Inject any remaining partial text (delta beyond what was already typed)
         let finalText = latestText
+        let delta = finalText.hasPrefix(typedText) ? String(finalText.dropFirst(typedText.count)) : finalText
         latestText = ""
+        typedText = ""
 
         wsConnection?.cancel()
         wsConnection = nil
@@ -73,7 +77,7 @@ class VoiceInputManager {
         micSeq = 2
 
         if !finalText.isEmpty {
-            injectViaAccessibility(finalText)
+            injectChars(finalText)
         }
 
         log("已停止")
@@ -89,6 +93,7 @@ class VoiceInputManager {
         default: break
         }
         latestText = ""
+        typedText = ""
         log("开始录音…")
         wasRecording = true; postStateNotification(true)
 
@@ -214,7 +219,7 @@ class VoiceInputManager {
                        let text = r["text"] as? String {
                         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
                         await self.log("实时: \"\(t)\"", level: .data)
-                        await MainActor.run { self.latestText = t }
+                        await MainActor.run { self.handlePartialResult(t) }
                     }
 
                     if (fl & 2) != 0 {
@@ -288,66 +293,45 @@ class VoiceInputManager {
         return out
     }
 
-    // MARK: - Inject via Accessibility API (bypasses all CGEvent / AppleScript issues)
-    private func injectViaAccessibility(_ text: String) {
+    // MARK: - Real-time streaming injection — only types the new (delta) characters
+    private func handlePartialResult(_ text: String) {
+        latestText = text
+        let delta = text.hasPrefix(typedText) ? String(text.dropFirst(typedText.count)) : text
+        guard !delta.isEmpty else { return }
+        typedText = text
+        injectChars(delta)
+    }
+
+    private func injectChars(_ text: String) {
         guard !text.isEmpty else { return }
 
-        // Wait a moment for system to settle (user just released push-to-talk)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            let app = NSWorkspace.shared.frontmostApplication
-            let pid = app?.processIdentifier ?? 0
-            guard pid > 0 else {
-                self.log("无法获取前台应用", level: .err)
-                self.fallbackInjectViaPasteboard(text)
-                return
-            }
+        DispatchQueue.main.async {
+            let source = CGEventSource(stateID: .hidSystemState)
 
-            let axApp = AXUIElementCreateApplication(pid)
-            var focused: CFTypeRef?
-            let err = AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString, &focused)
-            guard err == .success, let element = focused else {
-                self.log("AX focused element failed: \(err.rawValue)", level: .err)
-                self.fallbackInjectViaPasteboard(text)
-                return
-            }
+            for char in text.utf16 {
+                var codeUnit = char
 
-            let axEl = element as! AXUIElement
+                if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
+                    down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit)
+                    down.post(tap: .cghidEventTap)
+                }
 
-            // Set the value directly (works for text fields, text views, etc.)
-            let result = AXUIElementSetAttributeValue(axEl, kAXValueAttribute as CFString, text as CFTypeRef)
-            if result == .success {
-                self.log("AX直接注入成功 (\(text.count)字)", level: .ok)
-            } else {
-                self.log("AX注入失败 (\(result.rawValue)), 改用粘贴", level: .err)
-                self.fallbackInjectViaPasteboard(text)
+                if let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+                    up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit)
+                    up.post(tap: .cghidEventTap)
+                }
+
+                usleep(800)
             }
         }
     }
 
+    private func injectViaAccessibility(_ text: String) {
+        injectChars(text)
+    }
+
     private func fallbackInjectViaPasteboard(_ text: String) {
-        let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
-        pb.declareTypes([.string], owner: nil)
-        pb.setString(text, forType: .string)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            let src = CGEventSource(stateID: .hidSystemState)!
-            let vKey = CGKeyCode(9)
-            let down = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: true)!
-            down.flags = .maskCommand
-            down.post(tap: .cghidEventTap)
-            usleep(30_000)
-            let up = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: false)!
-            up.flags = .maskCommand
-            up.post(tap: .cghidEventTap)
-
-            self.log("已粘贴 (\(text.count)字)", level: .ok)
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                pb.clearContents()
-                if let s = saved { pb.setString(s, forType: .string) }
-            }
-        }
+        injectChars(text)
     }
 
     // MARK: - Helpers
