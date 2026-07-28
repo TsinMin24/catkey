@@ -55,9 +55,12 @@ class VoiceInputManager {
         postStateNotification(false)
         log("停止录音…")
 
-        // Inject any remaining partial text (delta beyond what was already typed)
-        let finalText = latestText
-        let delta = finalText.hasPrefix(typedText) ? String(finalText.dropFirst(typedText.count)) : finalText
+        // Inject any remaining untyped suffix via backspace+type logic
+        let finalText = latestText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cp = commonPrefixLen(typedText, finalText)
+        let deleteCount = typedText.count - cp
+        let suffixIdx = finalText.index(finalText.startIndex, offsetBy: cp)
+        let remaining = String(finalText[suffixIdx...])
         latestText = ""
         typedText = ""
 
@@ -76,8 +79,30 @@ class VoiceInputManager {
         micBuf.removeAll()
         micSeq = 2
 
-        if !finalText.isEmpty {
-            injectChars(finalText)
+        if !remaining.isEmpty {
+            // Use same backspace+append logic: first delete any stale suffix, then type new
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                let source = CGEventSource(stateID: .hidSystemState)
+                if deleteCount > 0 {
+                    let backspace: CGKeyCode = 0x33
+                    for _ in 0..<deleteCount {
+                        if let down = CGEvent(keyboardEventSource: source, virtualKey: backspace, keyDown: true) { down.post(tap: .cghidEventTap) }
+                        if let up = CGEvent(keyboardEventSource: source, virtualKey: backspace, keyDown: false) { up.post(tap: .cghidEventTap) }
+                        usleep(1000)
+                    }
+                }
+                for char in remaining.utf16 {
+                    var codeUnit = char
+                    if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
+                        down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit); down.post(tap: .cghidEventTap)
+                    }
+                    if let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+                        up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit); up.post(tap: .cghidEventTap)
+                    }
+                    usleep(1000)
+                }
+            }
         }
 
         log("已停止")
@@ -293,46 +318,129 @@ class VoiceInputManager {
         return out
     }
 
-    // MARK: - Real-time streaming injection — only types the new (delta) characters
-    private func handlePartialResult(_ text: String) {
-        latestText = text
-        let delta = text.hasPrefix(typedText) ? String(text.dropFirst(typedText.count)) : text
-        guard !delta.isEmpty else { return }
-        typedText = text
-        injectChars(delta)
-    }
+    // MARK: - Streaming injection with backspace correction
+    // When the LLM corrects earlier text, we compute the longest common prefix,
+    // send backspaces to erase the changed suffix, then type the corrected suffix.
+    // Short delay buffer smooths out rapid corrections before injecting.
 
-    private func injectChars(_ text: String) {
-        guard !text.isEmpty else { return }
+    private func handlePartialResult(_ newFullText: String) {
+        latestText = newFullText
+        let trimmed = newFullText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        DispatchQueue.main.async {
+        // Compute common prefix
+        let cp = commonPrefixLen(typedText, trimmed)
+        let deleteCount = typedText.count - cp
+        let suffixIdx = trimmed.index(trimmed.startIndex, offsetBy: cp)
+        let textToAppend = String(trimmed[suffixIdx...])
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
             let source = CGEventSource(stateID: .hidSystemState)
 
-            for char in text.utf16 {
-                var codeUnit = char
+            // 1) Delete changed suffix
+            if deleteCount > 0 {
+                let backspace: CGKeyCode = 0x33
+                for _ in 0..<deleteCount {
+                    if let down = CGEvent(keyboardEventSource: source, virtualKey: backspace, keyDown: true) {
+                        down.post(tap: .cghidEventTap)
+                    }
+                    if let up = CGEvent(keyboardEventSource: source, virtualKey: backspace, keyDown: false) {
+                        up.post(tap: .cghidEventTap)
+                    }
+                    usleep(1000)
+                }
+            }
 
+            // 2) Type new suffix
+            for char in textToAppend.utf16 {
+                var codeUnit = char
                 if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
                     down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit)
                     down.post(tap: .cghidEventTap)
                 }
-
                 if let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
                     up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit)
                     up.post(tap: .cghidEventTap)
                 }
+                usleep(1000)
+            }
 
+            self.typedText = trimmed
+        }
+    }
+
+    private func commonPrefixLen(_ a: String, _ b: String) -> Int {
+        let (s1, s2) = (Array(a), Array(b))
+        var i = 0
+        while i < s1.count && i < s2.count && s1[i] == s2[i] { i += 1 }
+        return i
+    }
+
+    // Legacy
+    private func injectChars(_ text: String) { typeStringGlobally(text) }
+    private func injectViaAccessibility(_ text: String) { typeStringGlobally(text) }
+    private func fallbackInjectViaPasteboard(_ text: String) { pasteTextGlobally(text) }
+
+    // MARK: Batch typing helpers
+
+    private func typeStringGlobally(_ text: String) {
+        DispatchQueue.main.async {
+            let source = CGEventSource(stateID: .hidSystemState)
+            for char in text.utf16 {
+                var codeUnit = char
+                if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
+                    down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit)
+                    down.post(tap: .cghidEventTap)
+                }
+                if let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+                    up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &codeUnit)
+                    up.post(tap: .cghidEventTap)
+                }
                 usleep(800)
             }
         }
     }
 
-    private func injectViaAccessibility(_ text: String) {
-        injectChars(text)
+    // MARK: Silent clipboard paste (for long text)
+
+    private func pasteTextGlobally(_ text: String) {
+        let pb = NSPasteboard.general
+        let changeCount = pb.changeCount
+
+        var previousItems: [(NSPasteboard.PasteboardType, Data)] = []
+        if let items = pb.pasteboardItems {
+            for item in items {
+                if let type = item.types.first, let data = item.data(forType: type) {
+                    previousItems.append((type, data))
+                }
+            }
+        }
+
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+
+        DispatchQueue.main.async {
+            let source = CGEventSource(stateID: .hidSystemState)
+            let vKey: CGKeyCode = 0x09
+            let down = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true)!
+            down.flags = .maskCommand
+            down.post(tap: .cghidEventTap)
+            let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false)!
+            up.flags = .maskCommand
+            up.post(tap: .cghidEventTap)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                if pb.changeCount == changeCount + 1 {
+                    pb.clearContents()
+                    for (type, data) in previousItems {
+                        pb.setData(data, forType: type)
+                    }
+                }
+            }
+        }
     }
 
-    private func fallbackInjectViaPasteboard(_ text: String) {
-        injectChars(text)
-    }
+    // MARK: - Streaming injection helpers (used from stopEverything)
 
     // MARK: - Helpers
     private func hmac(appId: String, token: String, ts: String, secret: String) -> String {

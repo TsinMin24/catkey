@@ -9,6 +9,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         hotkeyManager = HotkeyManager.shared
         hotkeyManager?.registerAll()
+
+        // Check Accessibility permission and prompt if needed
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        if !AXIsProcessTrustedWithOptions(opts as CFDictionary) {
+            LogManager.shared.append("请在 系统设置→隐私与安全性→辅助功能 中勾选 MagicKey，否则无法注入文字", level: .err)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
