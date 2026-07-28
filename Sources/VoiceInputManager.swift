@@ -7,17 +7,20 @@ import Foundation
 import CryptoKit
 import zlib
 
-// MARK: - VoiceInputManager — real-time streaming ASR via Volcengine SeedASR
 class VoiceInputManager {
     static let shared = VoiceInputManager()
 
-    // MARK: State
     private var audioEngine: AVAudioEngine?
     private var wasRecording = false
     private var streamTask: Task<Void, Never>?
+    private var sendTask: Task<Void, Error>?
+    private var recvTask: Task<Void, Error>?
+    private var wsConnection: NWConnection?
+    private var micBuf = Data()
+    private var micSeq: Int32 = 2
+    private var lastToggleTime: Date = .distantPast
     private let defaults = UserDefaults.standard
 
-    // MARK: Credentials
     var volcengineAppKey: String {
         get { defaults.string(forKey: "VolcengineAppKey") ?? "" }
         set { defaults.set(newValue, forKey: "VolcengineAppKey") }
@@ -32,19 +35,49 @@ class VoiceInputManager {
     }
     var isReady: Bool { !volcengineAppKey.isEmpty && !volcengineAccessKey.isEmpty }
 
-    // MARK: Public
+    // MARK: - Toggle (debounced)
     func toggleVoiceInput() {
+        let now = Date()
+        guard now.timeIntervalSince(lastToggleTime) >= 0.5 else { return }
+        lastToggleTime = now
+
         if wasRecording {
-            stopRecording()
-            streamTask?.cancel()
-            streamTask = nil
-            log("已强制停止")
+            stopEverything()
         } else {
             startStreaming()
         }
     }
 
-    // MARK: Start / Stop
+    // MARK: - Stop
+    private func stopEverything() {
+        guard wasRecording else { return }
+        wasRecording = false
+        postStateNotification(false)
+        log("停止录音…")
+
+        // 1) Cancel network first — unblocks ws.recv()
+        wsConnection?.cancel()
+        wsConnection = nil
+
+        // 2) Cancel tasks
+        recvTask?.cancel()
+        sendTask?.cancel()
+        streamTask?.cancel()
+        recvTask = nil
+        sendTask = nil
+        streamTask = nil
+
+        // 3) Stop audio
+        audioEngine?.stop()
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        audioEngine = nil
+        micBuf.removeAll()
+        micSeq = 2
+        overlayText = ""
+        log("已停止")
+    }
+
+    // MARK: - Start
     private func startStreaming() {
         guard !wasRecording, isReady else { showError("请先填写 API 凭证"); return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -63,23 +96,19 @@ class VoiceInputManager {
         streamTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             do { try await self.runStream(engine: engine) }
-            catch { await MainActor.run { self.log("错误: \(error.localizedDescription)", level: .err); self.cleanup() } }
+            catch {
+                await MainActor.run {
+                    if !self.wasRecording { return } // already stopped
+                    self.log("错误: \(error.localizedDescription)", level: .err)
+                    self.stopEverything()
+                }
+            }
         }
     }
 
-    private func stopRecording() {
-        guard wasRecording else { return }
-        log("停止录音…")
-        wasRecording = false
-        audioEngine?.stop()
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        audioEngine = nil
-        postStateNotification(false)
-    }
-
-    // MARK: Stream
+    // MARK: - Stream
     private func runStream(engine: AVAudioEngine) async throws {
-        // 1) WebSocket
+        // 1) WebSocket connect
         var hdrs = [
             "X-Api-App-Key": volcengineAppKey,
             "X-Api-Access-Key": volcengineAccessKey,
@@ -93,12 +122,14 @@ class VoiceInputManager {
             hdrs["X-Api-Timestamp"] = ts
             hdrs["X-Api-Signature"] = hmac(appId: volcengineAppKey, token: volcengineAccessKey, ts: ts, secret: sec)
         }
+
         let ws = try await ManualWS(host: "openspeech.bytedance.com", port: 443,
                                      path: "/api/v3/sauc/bigmodel_async", headers: hdrs, timeout: 60)
+        await MainActor.run { self.wsConnection = ws.underlyingConnection }
         defer { try? ws.close() }
         await log("WS 已连接", level: .ok)
 
-        // 2) Config
+        // 2) Config frame
         let cfg: [String: Any] = [
             "user": ["uid": "magickey"],
             "audio": ["format": "pcm", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1],
@@ -106,74 +137,125 @@ class VoiceInputManager {
                         "enable_ddc": false, "show_utterances": true, "result_type": "full"]
         ]
         let cfgJSON = try JSONSerialization.data(withJSONObject: cfg)
-        guard let gz = gzipData(cfgJSON) else { throw NSError(domain: "V", code: 1) }
+        guard let gz = gzipData(cfgJSON) else { throw NSError(domain: "V", code: 1, userInfo: [NSLocalizedDescriptionKey: "gzip config failed"]) }
         try await ws.send(cfgFrame(gz))
-        let _ = try await ws.recv()  // ack
-        await log("配置 ACK", level: .ok)
+        let ack = try await ws.recv()
+        await log("配置 ACK (\(ack.count)B)", level: .ok)
 
-        // 3) Install mic tap + concurrent send/recv
-        let doneFlag = NSLock()
-        var doneVal = false
-
-        // Sender
-        let sendTask = Task.detached(priority: .userInitiated) { [weak self] in
+        // 3) Concurrent sender + receiver
+        let sTask = Task<Void, Error> { [weak self] in
             guard let self = self else { return }
-            let eng = await MainActor.run { let e = AVAudioEngine(); return e }
-            await MainActor.run {
-                eng.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { buf, _ in
-                    guard let f = buf.floatChannelData else { return }
-                    let n = Int(buf.frameLength); var s = [Int16](repeating: 0, count: n)
+            let ok: Bool = await MainActor.run {
+                engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buf, _ in
+                    guard let self = self, let f = buf.floatChannelData else { return }
+                    let n = Int(buf.frameLength)
+                    var s = [Int16](repeating: 0, count: n)
                     for i in 0..<n { s[i] = Int16(max(-1, min(1, f.pointee[i])) * 32767) }
                     let raw = Data(bytes: &s, count: n * 2)
                     Task { await self.sendMicChunk(raw, ws: ws) }
                 }
-                do { try eng.start() } catch {}
+                do { try engine.start() } catch { return false }
+                return true
             }
-            // Keep alive
-            while true {
-                doneFlag.lock(); let exit = doneVal; doneFlag.unlock()
-                if exit || Task.isCancelled { break }
+            guard ok else { return }
+            // Keep-alive — loops until cancelled
+            while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
-            eng.stop(); eng.inputNode.removeTap(onBus: 0)
+            // Flush remaining mic buffer + send final frame
+            if !self.micBuf.isEmpty {
+                let lastChunk = self.micBuf
+                self.micBuf.removeAll()
+                let pcm16k = self.resample(int16: lastChunk, from: 44100, to: 16000)
+                if let gzFinal = self.gzipData(pcm16k) {
+                    var h = Data([0x11, 0x23, 0x01, 0x00]) // 0x23 = audio(2) | last-packet(3)
+                    var s = self.micSeq.bigEndian; h.append(Data(bytes: &s, count: 4))
+                    var sz = UInt32(gzFinal.count).bigEndian; h.append(Data(bytes: &sz, count: 4))
+                    h.append(gzFinal); self.micSeq += 1
+                    try? await ws.send(h)
+                    await self.log("已发送结束帧 (flags=0x3)", level: .info)
+                }
+            } else {
+                // Send an empty final frame
+                var h = Data([0x11, 0x22, 0x00, 0x00]) // 0x22 = audio(2) | last-packet(2, negative seq)
+                let negSeq = Int32(bitPattern: UInt32(bitPattern: -self.micSeq))
+                var s = negSeq.bigEndian; h.append(Data(bytes: &s, count: 4))
+                var sz = UInt32(0).bigEndian; h.append(Data(bytes: &sz, count: 4))
+                try? await ws.send(h)
+                await self.log("已发送空结束帧", level: .info)
+            }
+            await MainActor.run {
+                engine.stop()
+                engine.inputNode.removeTap(onBus: 0)
+            }
         }
+        await MainActor.run { self.sendTask = sTask }
 
-        // Receiver
-        let recvTask = Task.detached(priority: .userInitiated) { [weak self] in
+        let rTask = Task<Void, Error> { [weak self] in
             guard let self = self else { return }
-            var lastText = ""
-            while true {
-                do {
-                    let raw = try await ws.recv()
-                    guard raw.count >= 4 else { continue }
-                    let mt = raw[1] >> 4; let fl = raw[1] & 0x0F; let co = (raw[2] & 0x0F) == 1
-                    var off = 4; if (fl & 1) != 0 { off += 4 }
-                    if mt == 0x0F { await self.log("API错误", level: .err); break }
-                    if mt == 0x09 {
-                        let sz = raw.withUnsafeBytes { $0.load(fromByteOffset: off, as: UInt32.self) }.bigEndian; off += 4
-                        var b = raw.subdata(in: off..<off+Int(sz))
-                        if co, let d = Self.gunzipData(b) { b = d }
-                        if let json = try? JSONSerialization.jsonObject(with: b) as? [String: Any],
-                           let r = json["result"] as? [String: Any],
-                           let text = r["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            while !Task.isCancelled {
+                let raw = try await ws.recv()
+                guard raw.count >= 4 else { continue }
+                let mt = raw[1] >> 4
+                let fl = raw[1] & 0x0F
+                let co = (raw[2] & 0x0F) == 1
+                var off = 4
+                if (fl & 1) != 0 { off += 4 } // skip positive sequence number
+
+                // --- Error (0xF) ---
+                if mt == 0x0F {
+                    guard raw.count >= off + 8 else {
+                        await self.log("API 错误帧过短", level: .err)
+                        break
+                    }
+                    let errCode = raw.withUnsafeBytes { $0.load(fromByteOffset: off, as: UInt32.self) }.bigEndian
+                    off += 4
+                    let msgSize = raw.withUnsafeBytes { $0.load(fromByteOffset: off, as: UInt32.self) }.bigEndian
+                    off += 4
+                    let errMsg = raw.count >= off + Int(msgSize)
+                        ? String(data: raw.subdata(in: off..<off+Int(msgSize)), encoding: .utf8) ?? "?"
+                        : "?"
+                    await self.log("API错误 [\(errCode)]: \(errMsg)", level: .err)
+                    break
+                }
+
+                // --- Full response (0x9) ---
+                if mt == 0x09 {
+                    guard raw.count >= off + 4 else { continue }
+                    let sz = raw.withUnsafeBytes { $0.load(fromByteOffset: off, as: UInt32.self) }.bigEndian
+                    off += 4
+                    guard raw.count >= off + Int(sz) else { continue }
+                    var b = raw.subdata(in: off..<off+Int(sz))
+                    if co, let d = Self.gunzipData(b) { b = d }
+
+                    // Try parse as JSON response
+                    if let json = try? JSONSerialization.jsonObject(with: b) as? [String: Any],
+                       let r = json["result"] as? [String: Any],
+                       let text = r["text"] as? String {
+                        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !t.isEmpty {
                             await self.log("实时: \"\(t)\"", level: .data)
                             await MainActor.run { self.typeOverlay(t) }
-                            if (fl & 2) != 0 { await self.log("完成", level: .ok); break }
                         }
                     }
-                } catch { await self.log("recv err: \(error.localizedDescription)", level: .err); break }
+                    if (fl & 2) != 0 {
+                        await self.log("服务端完成", level: .ok)
+                        break
+                    }
+                }
             }
-            doneFlag.lock(); doneVal = true; doneFlag.unlock()
         }
+        await MainActor.run { self.recvTask = rTask }
 
-        _ = await sendTask.value
-        _ = await recvTask.value
+        // Wait for either to finish, then cancel the other
+        do {
+            _ = try await sTask.value
+        } catch {}
+        rTask.cancel()
+        _ = await rTask.result
     }
 
-    // MARK: Audio chunking + send
-    private var micBuf = Data()
-    private var micSeq: Int32 = 2
+    // MARK: - Audio send
     private func sendMicChunk(_ raw: Data, ws: ManualWS) async {
         micBuf.append(raw)
         while micBuf.count >= 3200 {
@@ -185,18 +267,18 @@ class VoiceInputManager {
             var s = micSeq.bigEndian; h.append(Data(bytes: &s, count: 4))
             var sz = UInt32(gz.count).bigEndian; h.append(Data(bytes: &sz, count: 4))
             h.append(gz); micSeq += 1
-            do { try await ws.send(h) } catch { micSeq = 2 }
+            do { try await ws.send(h) } catch { return }
         }
     }
 
-    // MARK: Config frame
+    // MARK: - Frames
     private func cfgFrame(_ payload: Data) -> Data {
         var h = Data([0x11, 0x10, 0x11, 0x00])
         var sz = UInt32(payload.count).bigEndian; h.append(Data(bytes: &sz, count: 4))
         h.append(payload); return h
     }
 
-    // MARK: gzip
+    // MARK: - Gzip
     private func gzipData(_ data: Data) -> Data? {
         guard let raw = rawDeflate(data) else { return nil }
         let hdr: [UInt8] = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff]
@@ -230,7 +312,7 @@ class VoiceInputManager {
         return out
     }
 
-    // MARK: Type overlay
+    // MARK: - Type overlay
     private var overlayText = ""
     private func typeOverlay(_ text: String) {
         guard let src = CGEventSource(stateID: .hidSystemState) else { return }
@@ -246,16 +328,15 @@ class VoiceInputManager {
         overlayText = text
     }
 
-    // MARK: Helpers
+    // MARK: - Helpers
     private func hmac(appId: String, token: String, ts: String, secret: String) -> String {
         let key = SymmetricKey(data: Data(secret.utf8))
         guard let msg = (appId + token + ts).data(using: .utf8) else { return "" }
         return Data(HMAC<SHA256>.authenticationCode(for: msg, using: key)).map { String(format: "%02x", $0) }.joined()
     }
-    private func showError(_ msg: String) { LogManager.shared.append(msg, level: .err); NSAlert().runModal() }
+    private func showError(_ msg: String) { LogManager.shared.append(msg, level: .err); let a = NSAlert(); a.messageText = msg; a.runModal() }
     private func log(_ msg: String, level: LogManager.Level = .info) { DispatchQueue.main.async { LogManager.shared.append(msg, level: level) } }
     private func postStateNotification(_ r: Bool) { NotificationCenter.default.post(name: NSNotification.Name("voiceRecordingStateChanged"), object: r) }
-    private func cleanup() { audioEngine?.stop(); audioEngine?.inputNode.removeTap(onBus: 0); audioEngine = nil; wasRecording = false; overlayText = ""; postStateNotification(false) }
     func pressEnter() {}
 }
 
@@ -264,6 +345,9 @@ private class ManualWS {
     private let conn: NWConnection
     private let queue = DispatchQueue(label: "ws")
     private var buf = Data()
+
+    var underlyingConnection: NWConnection { conn }
+
     init(host: String, port: UInt16, path: String, headers: [String: String], timeout: TimeInterval) async throws {
         let key = Data((0..<16).map { _ in UInt8.random(in: 0...255) }).base64EncodedString()
         var req = "GET \(path) HTTP/1.1\r\nHost: \(host)\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: \(key)\r\nSec-WebSocket-Version: 13\r\n"
@@ -279,7 +363,7 @@ private class ManualWS {
                         if let err = err { cc.resume(throwing: err); return }
                         let resp = d.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                         if resp.contains("101") { cc.resume() }
-                        else { cc.resume(throwing: NSError(domain: "WS", code: -1, userInfo: [NSLocalizedDescriptionKey: "handshake failed: \(resp.prefix(200))"])) }
+                        else { cc.resume(throwing: NSError(domain: "WS", code: -1, userInfo: [NSLocalizedDescriptionKey: "Handshake failed: \(resp.prefix(200))"])) }
                     }
                 })
             }
