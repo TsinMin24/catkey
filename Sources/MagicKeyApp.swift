@@ -1,6 +1,21 @@
 import SwiftUI
 import AppKit
 
+class RecordingObserver: ObservableObject {
+    static let shared = RecordingObserver()
+    @Published var isRecording = false
+
+    init() {
+        NotificationCenter.default.addObserver(self, selector: #selector(stateChanged), name: Notification.Name("voiceRecordingStateChanged"), object: nil)
+    }
+
+    @objc private func stateChanged(_ notif: Notification) {
+        if let val = notif.object as? Bool {
+            DispatchQueue.main.async { self.isRecording = val }
+        }
+    }
+}
+
 @main
 struct MagicKeyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -10,9 +25,18 @@ struct MagicKeyApp: App {
             Button("设置...") {
                 appDelegate.showSettings()
             }
+            .keyboardShortcut(",", modifiers: .command)
+            Button("实时日志...") {
+                appDelegate.showLog()
+            }
             Divider()
             Button("关于 Magic Key") {
                 NSApp.orderFrontStandardAboutPanel(nil)
+            }
+            if RecordingObserver.shared.isRecording {
+                Divider()
+                Text("正在录音...")
+                    .foregroundColor(.red)
             }
             Divider()
             Button("退出") {
@@ -20,13 +44,24 @@ struct MagicKeyApp: App {
             }
             .keyboardShortcut("q")
         } label: {
-            pawIcon
+            MenuBarLabelView()
         }
     }
+}
 
-    var pawIcon: some View {
-        Image(nsImage: catPawImage())
-            .renderingMode(.template)
+struct MenuBarLabelView: View {
+    @ObservedObject private var observer = RecordingObserver.shared
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Image(nsImage: catPawImage())
+                .renderingMode(.template)
+            if observer.isRecording {
+                Circle()
+                    .fill(.red)
+                    .frame(width: 6, height: 6)
+            }
+        }
     }
 }
 

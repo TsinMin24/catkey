@@ -3,6 +3,25 @@ import AppKit
 
 struct SettingsView: View {
     @StateObject private var store = KeyBindingStore.shared
+    @State private var appKey = VoiceInputManager.shared.volcengineAppKey
+    @State private var accessKey = VoiceInputManager.shared.volcengineAccessKey
+    @State private var secretKey = VoiceInputManager.shared.volcengineSecretKey
+    @State private var savedText = ""
+    @State private var savedColor = Color.secondary
+    @State private var showAppKey = false
+    @State private var showAccessKey = false
+    @State private var showSecretKey = false
+
+    private func saveApiConfig() {
+        VoiceInputManager.shared.volcengineAppKey = appKey
+        VoiceInputManager.shared.volcengineAccessKey = accessKey
+        VoiceInputManager.shared.volcengineSecretKey = secretKey
+        savedText = "已保存"
+        savedColor = .green
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            savedText = ""
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -11,10 +30,13 @@ struct SettingsView: View {
                 .padding(.top, 20)
                 .padding(.bottom, 8)
 
-            Text("点击「选择应用」为每个按键绑定一个应用")
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .padding(.bottom, 16)
+            // ── App Toggle Bindings ──
+            Text("应用切换按键 (F13-F16)")
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 4)
 
             ForEach(Array(store.bindings.enumerated()), id: \.offset) { index, binding in
                 BindingRow(binding: binding) { newBinding in
@@ -24,21 +46,122 @@ struct SettingsView: View {
                 Divider().padding(.horizontal, 20)
             }
 
-            Spacer()
+            // ── Voice Input ──
+            Text("语音输入 (F20)")
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
 
-            Text("需要在系统设置中授予辅助功能权限")
+            VStack(spacing: 8) {
+                HStack {
+                    Text("App ID").frame(width: 90, alignment: .trailing)
+                    ZStack(alignment: .trailing) {
+                        if showAppKey {
+                            TextField("App ID", text: $appKey)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            SecureField("App ID", text: $appKey)
+                        }
+                        Button(action: { showAppKey.toggle() }) {
+                            Image(systemName: showAppKey ? "eye.slash.fill" : "eye.fill")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 6)
+                    }
+                    .font(.system(.caption, design: .monospaced))
+                }
+                HStack {
+                    Text("Access Token").frame(width: 90, alignment: .trailing)
+                    ZStack(alignment: .trailing) {
+                        if showAccessKey {
+                            TextField("Access Token", text: $accessKey)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            SecureField("Access Token", text: $accessKey)
+                        }
+                        Button(action: { showAccessKey.toggle() }) {
+                            Image(systemName: showAccessKey ? "eye.slash.fill" : "eye.fill")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 6)
+                    }
+                    .font(.system(.caption, design: .monospaced))
+                }
+                HStack {
+                    Text("Secret Key").frame(width: 90, alignment: .trailing)
+                    ZStack(alignment: .trailing) {
+                        if showSecretKey {
+                            TextField("Secret Key（留空则不签名）", text: $secretKey)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            SecureField("Secret Key（留空则不签名）", text: $secretKey)
+                        }
+                        Button(action: { showSecretKey.toggle() }) {
+                            Image(systemName: showSecretKey ? "eye.slash.fill" : "eye.fill")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 6)
+                    }
+                    .font(.system(.caption, design: .monospaced))
+                }
+            }
+            .padding(.horizontal, 20)
+
+            // ── API Save ──
+            HStack(spacing: 12) {
+                Button("保存 API 配置") {
+                    saveApiConfig()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Text(savedText)
+                    .font(.caption)
+                    .foregroundColor(savedColor)
+            }
+            .padding(.top, 6)
+            .padding(.bottom, 4)
+
+            // ── Functional Keys Info ──
+            Text("P0.22 = 回车键  |  P0.24(F20) = 按一下录音，再按停止并识别")
                 .font(.caption2)
                 .foregroundColor(.secondary)
-                .padding(.bottom, 8)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
 
-            Button("打开辅助功能设置") {
-                let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-                NSWorkspace.shared.open(url)
+            // ── Footer ──
+            Text("需要在系统设置中授予「辅助功能」和「麦克风」权限")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .padding(.bottom, 4)
+
+            HStack(spacing: 16) {
+                Button("打开辅助功能设置") {
+                    let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+                    NSWorkspace.shared.open(url)
+                }
+                .buttonStyle(.link)
+                .controlSize(.small)
+
+                Button("打开麦克风设置") {
+                    let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
+                    NSWorkspace.shared.open(url)
+                }
+                .buttonStyle(.link)
+                .controlSize(.small)
             }
-            .buttonStyle(.link)
             .padding(.bottom, 16)
         }
-        .frame(width: 480, height: 360)
+        .frame(width: 500, height: 550)
     }
 }
 

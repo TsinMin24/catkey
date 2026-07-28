@@ -24,5 +24,7 @@
     <true/>
     <key>NSAccessibilityUsageDescription</key>
     <string>Magic Key 需要辅助功能权限来控制窗口的最小化和恢复。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Magic Key 需要麦克风权限来进行语音输入识别。</string>
 </dict>
 </plist>

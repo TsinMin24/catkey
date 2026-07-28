@@ -29,6 +29,11 @@ swiftc \
     -framework SwiftUI \
     -framework AppKit \
     -framework Carbon \
+    -framework Network \
+    -framework AVFoundation \
+    -framework CoreGraphics \
+    -framework CryptoKit \
+    -lz \
     -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     "$SOURCES_DIR/MagicKeyApp.swift" \
     "$SOURCES_DIR/AppDelegate.swift" \
@@ -36,6 +41,9 @@ swiftc \
     "$SOURCES_DIR/AppToggleManager.swift" \
     "$SOURCES_DIR/KeyBinding.swift" \
     "$SOURCES_DIR/SettingsView.swift" \
+    "$SOURCES_DIR/VoiceInputManager.swift" \
+    "$SOURCES_DIR/LogManager.swift" \
+    "$SOURCES_DIR/LogWindow.swift" \
     -Xlinker -rpath -Xlinker /usr/lib/swift
 
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
