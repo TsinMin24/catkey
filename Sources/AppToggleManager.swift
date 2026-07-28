@@ -16,13 +16,16 @@ class AppToggleManager {
         let isFrontmost = frontmostBundleID == bundleID
 
         if app.isHidden {
+            // 被隐藏 → 恢复
             app.unhide()
             app.activate(options: [.activateIgnoringOtherApps])
         } else if !hasVisibleWindows(for: app) {
+            // 窗口全最小化 → 用 openApplication 恢复（用户确认有效）
             if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
                 NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
             }
         } else if isFrontmost {
+            // 在前台且有可见窗口 → 隐藏（效果类似最小化）
             app.hide()
         } else {
             app.activate(options: [.activateIgnoringOtherApps])
