@@ -1,0 +1,79 @@
+#!/bin/bash
+#
+# 提交前密钥扫描
+#
+# 拦截两类东西：
+#   1. 常见密钥格式（sk- / tp- / ttp- / 私钥块 / key = "..." 赋值）
+#   2. 本机 App 偏好设置里真实保存的 API Key（即使格式不典型也能拦到）
+#
+# 只检查本次提交新增的行，误报可以用 git commit --no-verify 跳过，
+# 但请先确认那行内容确实不是密钥。
+#
+# 启用方式（换机器克隆后执行一次）：
+#   git config core.hooksPath .githooks
+
+set -uo pipefail
+
+staged=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+[ -z "$staged" ] && exit 0
+
+# 常见密钥格式
+patterns=(
+  'sk-[A-Za-z0-9_-]{16,}'
+  'tp-[A-Za-z0-9_-]{16,}'
+  'ttp-[A-Za-z0-9_-]{16,}'
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+)
+# 赋值型：api_key = "xxxxx"
+assign_re='(api[_-]?key|secret[_-]?key|access[_-]?key|auth[_-]?token|password)[[:space:]]*[:=][[:space:]]*["'\''][^"'\'']{12,}["'\'']'
+
+# 本机偏好里真实存在的密钥值（只在本机生效，不写进仓库）
+local_secrets=()
+if command -v defaults >/dev/null 2>&1; then
+  while IFS= read -r value; do
+    [ "${#value}" -ge 12 ] && local_secrets+=("$value")
+  done < <(defaults read com.magickey.app 2>/dev/null \
+    | sed -nE 's/^[[:space:]]*[^=]*(APIKey|AccessKey|SecretKey|ApiKey)[^=]*=[[:space:]]*"?([^";]*)"?;?[[:space:]]*$/\2/p' \
+    | sort -u)
+fi
+
+fail=0
+report() {
+  echo "✖ 提交被拦截：$1"
+  echo "  文件：$2"
+  fail=1
+}
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  # 扫描脚本自身不做检查，否则规则文本会把自己拦住
+  case "$file" in .githooks/*) continue ;; esac
+
+  # 只取新增行；二进制文件跳过
+  added=$(git diff --cached -U0 -- "$file" 2>/dev/null | grep '^+' | grep -v '^+++')
+  [ -z "$added" ] && continue
+
+  for pattern in "${patterns[@]}"; do
+    if printf '%s\n' "$added" | grep -qE -- "$pattern"; then
+      report "疑似密钥（格式 $pattern）" "$file"
+    fi
+  done
+
+  if printf '%s\n' "$added" | grep -qEi "$assign_re"; then
+    report "疑似密钥赋值" "$file"
+  fi
+
+  for secret in "${local_secrets[@]}"; do
+    if printf '%s\n' "$added" | grep -qF -- "$secret"; then
+      report "命中本机偏好设置里保存的密钥（值已隐藏）" "$file"
+    fi
+  done
+done <<< "$staged"
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "已阻止本次提交。如果确认是误报，可以用 git commit --no-verify 跳过。"
+  exit 1
+fi
+
+exit 0
