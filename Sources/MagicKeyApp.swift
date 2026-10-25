@@ -22,13 +22,10 @@ struct MagicKeyApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            Button("设置...") {
+            Button("设置与日志...") {
                 appDelegate.showSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
-            Button("实时日志...") {
-                appDelegate.showLog()
-            }
             Divider()
             Button("关于 Magic Key") {
                 NSApp.orderFrontStandardAboutPanel(nil)
